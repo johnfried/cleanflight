@@ -93,6 +93,23 @@ void pidResetErrorGyro(void)
 
 const angle_index_t rcAliasToAngleIndexMap[] = { AI_ROLL, AI_PITCH };
 
+
+// PT1 Element filter for PID controllers
+float pt1_element(int axis, float delta, uint8_t f_cut) {
+
+	float dT = (float)cycleTime * 0.000001f;
+
+    static float    RC;
+    static float    lastDTerm[3] = { 0.0f, 0.0f, 0.0f };
+
+    RC = 1.0f / ( 2.0f * (float)M_PI * (float) f_cut );
+
+    delta = lastDTerm[axis] + dT / (RC + dT) * (delta - lastDTerm[axis]);
+    lastDTerm[axis] = delta;
+
+    return delta;
+}
+
 #ifdef AUTOTUNE
 bool shouldAutotune(void)
 {
@@ -202,6 +219,11 @@ static void pidLuxFloat(pidProfile_t *pidProfile, controlRateConfig_t *controlRa
         deltaSum = delta1[axis] + delta2[axis] + delta;
         delta2[axis] = delta1[axis];
         delta1[axis] = delta;
+
+        if (pidProfile->main_cut_hz) {
+            deltaSum = pt1_element(axis, deltaSum, pidProfile->main_cut_hz);
+        }
+
         DTerm = constrainf((deltaSum / 3.0f) * pidProfile->D_f[axis] * PIDweight[axis] / 100, -300.0f, 300.0f);
 
         // -----calculate total PID output
@@ -287,6 +309,11 @@ static void pidMultiWii(pidProfile_t *pidProfile, controlRateConfig_t *controlRa
         deltaSum = delta1[axis] + delta2[axis] + delta;
         delta2[axis] = delta1[axis];
         delta1[axis] = delta;
+
+        if (pidProfile->main_cut_hz) {
+            deltaSum = pt1_element(axis, (float) deltaSum, pidProfile->main_cut_hz);
+        }
+
         DTerm = (deltaSum * dynD8[axis]) / 32;
         axisPID[axis] = PTerm + ITerm - DTerm;
 
@@ -366,6 +393,10 @@ static void pidMultiWii23(pidProfile_t *pidProfile, controlRateConfig_t *control
         DTerm = delta1[axis] + delta2[axis] + delta;
         delta2[axis] = delta1[axis];
         delta1[axis] = delta;
+
+        if (pidProfile->main_cut_hz) {
+        	DTerm = pt1_element(axis, (float) DTerm, pidProfile->main_cut_hz);
+        }
 
         DTerm = ((int32_t)DTerm * dynD8[axis]) >> 5;   // 32 bits is needed for calculation
 
@@ -479,6 +510,11 @@ static void pidMultiWiiHybrid(pidProfile_t *pidProfile, controlRateConfig_t *con
         deltaSum = delta1[axis] + delta2[axis] + delta;
         delta2[axis] = delta1[axis];
         delta1[axis] = delta;
+
+        if (pidProfile->main_cut_hz) {
+        	deltaSum = pt1_element(axis, (float) deltaSum, pidProfile->main_cut_hz);
+        }
+
         DTerm = (deltaSum * dynD8[axis]) / 32;
         axisPID[axis] = PTerm + ITerm - DTerm;
 
@@ -743,6 +779,11 @@ static void pidRewrite(pidProfile_t *pidProfile, controlRateConfig_t *controlRat
         deltaSum = delta1[axis] + delta2[axis] + delta;
         delta2[axis] = delta1[axis];
         delta1[axis] = delta;
+
+        if (pidProfile->main_cut_hz) {
+        	deltaSum = pt1_element(axis, (float) deltaSum, pidProfile->main_cut_hz);
+        }
+
         DTerm = (deltaSum * pidProfile->D8[axis] * PIDweight[axis] / 100) >> 8;
 
         // -----calculate total PID output
