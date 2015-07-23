@@ -256,6 +256,7 @@ typedef enum BlackboxState {
     BLACKBOX_STATE_SEND_GPS_G_HEADER,
     BLACKBOX_STATE_SEND_SLOW_HEADER,
     BLACKBOX_STATE_SEND_SYSINFO,
+    BLACKBOX_STATE_PAUSED,
     BLACKBOX_STATE_RUNNING,
     BLACKBOX_STATE_SHUTTING_DOWN
 } BlackboxState;
@@ -348,6 +349,8 @@ static blackboxMainState_t blackboxHistoryRing[3];
 
 // These point into blackboxHistoryRing, use them to know where to store history of a given age (0, 1 or 2 generations old)
 static blackboxMainState_t* blackboxHistory[3];
+
+static bool blackboxModeActivationConditionPresent = false;
 
 static bool testBlackboxConditionUncached(FlightLogFieldCondition condition)
 {
@@ -454,9 +457,6 @@ static void blackboxSetState(BlackboxState newState)
             xmitState.headerIndex = 0;
         break;
         case BLACKBOX_STATE_RUNNING:
-            blackboxIteration = 0;
-            blackboxPFrameIndex = 0;
-            blackboxIFrameIndex = 0;
             blackboxSlowFrameIterationTimer = SLOW_FRAME_INTERVAL; //Force a slow frame to be written on the first iteration
         break;
         case BLACKBOX_STATE_SHUTTING_DOWN:
@@ -795,6 +795,12 @@ void startBlackbox(void)
          * cache those now.
          */
         blackboxBuildConditionCache();
+        
+        blackboxModeActivationConditionPresent = isModeActivationConditionPresent(currentProfile->modeActivationConditions, BOXBLACKBOX);
+
+        blackboxIteration = 0;
+        blackboxPFrameIndex = 0;
+        blackboxIFrameIndex = 0;
 
         /*
          * Record the beeper's current idea of the last arming beep time, so that we can detect it changing when
@@ -811,7 +817,7 @@ void startBlackbox(void)
  */
 void finishBlackbox(void)
 {
-    if (blackboxState == BLACKBOX_STATE_RUNNING) {
+    if (blackboxState == BLACKBOX_STATE_RUNNING || blackboxState == BLACKBOX_STATE_PAUSED) {
         blackboxLogEvent(FLIGHT_LOG_EVENT_LOG_END, NULL);
 
         blackboxSetState(BLACKBOX_STATE_SHUTTING_DOWN);
@@ -1099,7 +1105,8 @@ static bool blackboxWriteSysinfo()
  */
 void blackboxLogEvent(FlightLogEvent event, flightLogEventData_t *data)
 {
-    if (blackboxState != BLACKBOX_STATE_RUNNING) {
+    // Only allow events to be logged after headers have been written
+    if (!(blackboxState == BLACKBOX_STATE_RUNNING || blackboxState == BLACKBOX_STATE_PAUSED)) {
         return;
     }
 
@@ -1141,6 +1148,10 @@ void blackboxLogEvent(FlightLogEvent event, flightLogEventData_t *data)
                 blackboxWriteSignedVB(data->inflightAdjustment.newValue);
             }
         break;
+        case FLIGHT_LOG_EVENT_LOGGING_RESUME:
+            blackboxWriteUnsignedVB(data->loggingResume.logIteration);
+            blackboxWriteUnsignedVB(data->loggingResume.currentTime);
+        break;
         case FLIGHT_LOG_EVENT_LOG_END:
             blackboxPrint("End of log");
             blackboxWrite(0);
@@ -1175,11 +1186,28 @@ static bool blackboxShouldLogPFrame(uint32_t pFrameIndex)
     return (pFrameIndex + masterConfig.blackbox_rate_num - 1) % masterConfig.blackbox_rate_denom < masterConfig.blackbox_rate_num;
 }
 
+static bool blackboxShouldLogIFrame() {
+    return blackboxPFrameIndex == 0;
+}
+
+// Called once every FC loop in order to keep track of how many FC loop iterations have passed
+static void blackboxAdvanceIterationTimers()
+{
+    blackboxSlowFrameIterationTimer++;
+    blackboxIteration++;
+    blackboxPFrameIndex++;
+
+    if (blackboxPFrameIndex == BLACKBOX_I_INTERVAL) {
+        blackboxPFrameIndex = 0;
+        blackboxIFrameIndex++;
+    }
+}
+
 // Called once every FC loop in order to log the current state
 static void blackboxLogIteration()
 {
     // Write a keyframe every BLACKBOX_I_INTERVAL frames so we can resynchronise upon missing frames
-    if (blackboxPFrameIndex == 0) {
+    if (blackboxShouldLogIFrame()) {
         /*
          * Don't log a slow frame if the slow data didn't change ("I" frames are already large enough without adding
          * an additional item to write at the same time)
@@ -1226,15 +1254,6 @@ static void blackboxLogIteration()
 
     //Flush every iteration so that our runtime variance is minimized
     blackboxDeviceFlush();
-
-    blackboxSlowFrameIterationTimer++;
-    blackboxIteration++;
-    blackboxPFrameIndex++;
-
-    if (blackboxPFrameIndex == BLACKBOX_I_INTERVAL) {
-        blackboxPFrameIndex = 0;
-        blackboxIFrameIndex++;
-    }
 }
 
 /**
@@ -1305,10 +1324,33 @@ void handleBlackbox(void)
                 blackboxSetState(BLACKBOX_STATE_RUNNING);
             }
         break;
+        case BLACKBOX_STATE_PAUSED:
+            // Only allow resume to occur during an I-frame iteration, so that we have an "I" base to work from
+            if (IS_RC_MODE_ACTIVE(BOXBLACKBOX) && blackboxShouldLogIFrame()) {
+                // Write a log entry so the decoder is aware that our large time/iteration skip is intended
+                flightLogEvent_loggingResume_t resume;
+
+                resume.logIteration = blackboxIteration;
+                resume.currentTime = currentTime;
+
+                blackboxLogEvent(FLIGHT_LOG_EVENT_LOGGING_RESUME, (flightLogEventData_t *) &resume);
+                blackboxSetState(BLACKBOX_STATE_RUNNING);
+                
+                blackboxLogIteration();
+            }
+
+            // Keep the logging timers ticking so our log iteration continues to advance
+            blackboxAdvanceIterationTimers();
+        break;
         case BLACKBOX_STATE_RUNNING:
             // On entry to this state, blackboxIteration, blackboxPFrameIndex and blackboxIFrameIndex are reset to 0
+            if (blackboxModeActivationConditionPresent && !IS_RC_MODE_ACTIVE(BOXBLACKBOX)) {
+                blackboxSetState(BLACKBOX_STATE_PAUSED);
+            } else {
+                blackboxLogIteration();
+            }
 
-            blackboxLogIteration();
+            blackboxAdvanceIterationTimers();
         break;
         case BLACKBOX_STATE_SHUTTING_DOWN:
             //On entry of this state, startTime is set and a flush is performed
