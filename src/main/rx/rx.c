@@ -333,8 +333,10 @@ static void processRxChannels(void)
         }
 
         // validate the range
-        if (sample < rxConfig->rx_min_usec || sample > rxConfig->rx_max_usec)
-            sample = rxConfig->midrc;
+        if (sample < rxConfig->rx_min_usec || sample > rxConfig->rx_max_usec) {
+            // rx failure: apply failure value to remapped channel
+            sample = RXFAIL_STEP_TO_CHANNEL_VALUE(rxConfig->rx_fail_usec_steps[rawChannel]);
+        }
 
         if (isRxDataDriven()) {
             rcData[chan] = sample;
